@@ -18,6 +18,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { shouldUseFastPath, runFastPath } from './fast-path.js';
 import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
   getAllChats,
@@ -156,6 +157,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // Fast path: simple conversational messages go directly to Venice API
+  // without spawning a container or going through the Claude Agent SDK.
+  if (shouldUseFastPath(missedMessages, isMainGroup)) {
+    logger.info({ group: group.name, messageCount: missedMessages.length }, 'Fast path');
+
+    lastAgentTimestamp[chatJid] = missedMessages[missedMessages.length - 1].timestamp;
+    saveState();
+
+    await channel.setTyping?.(chatJid, true);
+    const response = await runFastPath(chatJid, group.folder, ASSISTANT_NAME, missedMessages);
+    await channel.setTyping?.(chatJid, false);
+
+    if (response) {
+      await channel.sendMessage(chatJid, response);
+      return true;
+    }
+    // Fast path returned null (API error) — fall through to container path
+    logger.info({ group: group.name }, 'Fast path failed, falling back to container');
+  }
+
   const prompt = formatMessages(missedMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -167,7 +188,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
+    'Processing messages (container path)',
   );
 
   // Track idle timer for closing stdin when agent is idle
@@ -182,6 +203,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  // Telegram's typing indicator expires after ~5s, so resend it periodically
+  const typingInterval = setInterval(() => {
+    channel.setTyping?.(chatJid, true)?.catch(() => {});
+  }, 4000);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -209,6 +234,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
+  clearInterval(typingInterval);
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
