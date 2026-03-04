@@ -35,6 +35,7 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  routingConfig?: Record<string, string>;
 }
 
 export interface ContainerOutput {
@@ -196,6 +197,22 @@ function readSecrets(): Record<string, string> {
   return secrets;
 }
 
+/**
+ * Read per-group routing config from .venice-routing.json if it exists.
+ */
+function readRoutingConfig(groupFolder: string): Record<string, string> | undefined {
+  const groupDir = resolveGroupFolderPath(groupFolder);
+  const configPath = path.join(groupDir, '.venice-routing.json');
+  try {
+    if (fs.existsSync(configPath)) {
+      return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    }
+  } catch (err) {
+    logger.warn({ groupFolder, err }, 'Failed to read .venice-routing.json');
+  }
+  return undefined;
+}
+
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -281,10 +298,12 @@ export async function runContainerAgent(
 
     // Pass secrets via stdin (never written to disk or mounted as files)
     input.secrets = readSecrets();
+    input.routingConfig = readRoutingConfig(input.groupFolder);
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs
     delete input.secrets;
+    delete input.routingConfig;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
