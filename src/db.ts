@@ -60,6 +60,19 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
 
+    CREATE TABLE IF NOT EXISTS container_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      run_type TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      exit_code INTEGER,
+      error TEXT,
+      first_response_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_container_runs_started ON container_runs(started_at);
+
     CREATE TABLE IF NOT EXISTS router_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -78,6 +91,13 @@ function createSchema(database: Database.Database): void {
       requires_trigger INTEGER DEFAULT 1
     );
   `);
+
+  // Add last_used column to sessions if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN last_used TEXT`);
+  } catch {
+    /* column already exists */
+  }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
@@ -124,10 +144,21 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('foreign_keys = ON');
   createSchema(db);
 
   // Migrate from JSON files if they exist
   migrateJsonState();
+
+  // Prune old data on startup
+  const msgsPruned = pruneOldMessages(30);
+  const logsPruned = pruneOldTaskRunLogs(90);
+  const runsPruned = pruneOldContainerRuns(90);
+  if (msgsPruned > 0 || logsPruned > 0 || runsPruned > 0) {
+    logger.info({ msgsPruned, logsPruned, runsPruned }, 'Pruned old database records');
+  }
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -284,24 +315,30 @@ export function getNewMessages(
   jids: string[],
   lastTimestamp: string,
   botPrefix: string,
+  limit: number = 200,
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
+  // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
-    FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders})
-      AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+    FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp
+      FROM messages
+      WHERE timestamp > ? AND chat_jid IN (${placeholders})
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
   `;
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`) as NewMessage[];
+    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -315,20 +352,26 @@ export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
   botPrefix: string,
+  limit: number = 200,
 ): NewMessage[] {
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
+  // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
-    FROM messages
-    WHERE chat_jid = ? AND timestamp > ?
-      AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+    FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp
+      FROM messages
+      WHERE chat_jid = ? AND timestamp > ?
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
   `;
   return db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
 export function createTask(
@@ -489,9 +532,18 @@ export function getSession(groupFolder: string): string | undefined {
 }
 
 export function setSession(groupFolder: string, sessionId: string): void {
+  const now = new Date().toISOString();
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    'INSERT OR REPLACE INTO sessions (group_folder, session_id, last_used) VALUES (?, ?, ?)',
+  ).run(groupFolder, sessionId, now);
+}
+
+export function getSessionMeta(groupFolder: string): { sessionId: string; lastUsed: string | null } | undefined {
+  const row = db
+    .prepare('SELECT session_id, last_used FROM sessions WHERE group_folder = ?')
+    .get(groupFolder) as { session_id: string; last_used: string | null } | undefined;
+  if (!row) return undefined;
+  return { sessionId: row.session_id, lastUsed: row.last_used };
 }
 
 export function getAllSessions(): Record<string, string> {
@@ -598,6 +650,98 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Container run logging ---
+
+export interface ContainerRunLog {
+  group_folder: string;
+  run_type: 'message' | 'task' | 'interrupt';
+  started_at: string;
+  duration_ms: number;
+  status: 'success' | 'error' | 'timeout';
+  exit_code: number | null;
+  error: string | null;
+  first_response_ms?: number | null;
+}
+
+export function logContainerRun(log: ContainerRunLog): void {
+  db.prepare(`
+    INSERT INTO container_runs (group_folder, run_type, started_at, duration_ms, status, exit_code, error, first_response_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    log.group_folder,
+    log.run_type,
+    log.started_at,
+    log.duration_ms,
+    log.status,
+    log.exit_code,
+    log.error,
+    log.first_response_ms ?? null,
+  );
+}
+
+// --- Heartbeat queries ---
+
+export function getRecentContainerFailures(windowMs: number): number {
+  const cutoff = new Date(Date.now() - windowMs).toISOString();
+  const row = db
+    .prepare(`SELECT COUNT(*) as c FROM container_runs WHERE status = 'error' AND started_at > ?`)
+    .get(cutoff) as { c: number };
+  return row.c;
+}
+
+export function getContainerFailuresByGroup(windowMs: number): Array<{ group_folder: string; count: number }> {
+  const cutoff = new Date(Date.now() - windowMs).toISOString();
+  return db
+    .prepare(`SELECT group_folder, COUNT(*) as count FROM container_runs WHERE status = 'error' AND started_at > ? GROUP BY group_folder`)
+    .all(cutoff) as Array<{ group_folder: string; count: number }>;
+}
+
+export function getRecentTaskRunFailures(windowMs: number): number {
+  const cutoff = new Date(Date.now() - windowMs).toISOString();
+  const row = db
+    .prepare(`SELECT COUNT(*) as c FROM task_run_logs WHERE status = 'error' AND run_at > ?`)
+    .get(cutoff) as { c: number };
+  return row.c;
+}
+
+export function getOverdueTasks(thresholdMs: number): ScheduledTask[] {
+  const cutoff = new Date(Date.now() - thresholdMs).toISOString();
+  return db
+    .prepare(`SELECT * FROM scheduled_tasks WHERE status = 'active' AND next_run IS NOT NULL AND next_run < ?`)
+    .all(cutoff) as ScheduledTask[];
+}
+
+export function getRecentContainerErrors(windowMs: number): Array<{ group_folder: string; error: string; started_at: string }> {
+  const cutoff = new Date(Date.now() - windowMs).toISOString();
+  return db
+    .prepare(`SELECT group_folder, error, started_at FROM container_runs WHERE status = 'error' AND error IS NOT NULL AND started_at > ? ORDER BY started_at DESC`)
+    .all(cutoff) as Array<{ group_folder: string; error: string; started_at: string }>;
+}
+
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
+// --- Pruning ---
+
+export function pruneOldContainerRuns(maxAgeDays = 90): number {
+  const cutoff = new Date(Date.now() - maxAgeDays * 86400000).toISOString();
+  const result = db.prepare('DELETE FROM container_runs WHERE started_at < ?').run(cutoff);
+  return result.changes;
+}
+
+export function pruneOldMessages(maxAgeDays = 30): number {
+  const cutoff = new Date(Date.now() - maxAgeDays * 86400000).toISOString();
+  const result = db.prepare('DELETE FROM messages WHERE timestamp < ?').run(cutoff);
+  return result.changes;
+}
+
+export function pruneOldTaskRunLogs(maxAgeDays = 90): number {
+  const cutoff = new Date(Date.now() - maxAgeDays * 86400000).toISOString();
+  const result = db.prepare('DELETE FROM task_run_logs WHERE run_at < ?').run(cutoff);
+  return result.changes;
 }
 
 // --- JSON migration ---

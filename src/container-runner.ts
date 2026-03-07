@@ -15,6 +15,7 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
+import { logContainerRun } from './db.js';
 import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -25,6 +26,8 @@ import { RegisteredGroup } from './types.js';
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const STREAM_TEXT_MARKER = '---NANOCLAW_STREAM_TEXT---';
+const STREAM_TEXT_END_MARKER = '---NANOCLAW_STREAM_TEXT_END---';
 
 export interface ContainerInput {
   prompt: string;
@@ -34,6 +37,8 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  modelOverride?: string;
+  runType?: 'message' | 'task' | 'interrupt';
   secrets?: Record<string, string>;
   routingConfig?: Record<string, string>;
 }
@@ -157,7 +162,7 @@ function buildVolumeMounts(
   // groups. Recompiled on container startup via entrypoint.sh.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  if (fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
@@ -184,7 +189,7 @@ function buildVolumeMounts(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL']);
+  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'GH_TOKEN']);
   // If using Venice proxy, pass the base URL so the SDK inside the
   // container can reach the proxy running on the host.
   const baseUrl = secrets.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL;
@@ -215,6 +220,19 @@ function readRoutingConfig(groupFolder: string): Record<string, string> | undefi
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Resource limits: prevent runaway containers from exhausting host resources
+  args.push(
+    '--memory', '2g',
+    '--cpus', '2',
+    '--pids-limit', '512',
+  );
+
+  // Security hardening: drop all capabilities and prevent privilege escalation
+  args.push(
+    '--cap-drop', 'all',
+    '--security-opt', 'no-new-privileges',
+  );
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -247,6 +265,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onStreamDelta?: (text: string) => void,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -298,7 +317,22 @@ export async function runContainerAgent(
 
     // Pass secrets via stdin (never written to disk or mounted as files)
     input.secrets = readSecrets();
+
+    // Model priority: per-task override > per-group .model file > global env
+    if (input.modelOverride) {
+      input.secrets.CLAUDE_MODEL = input.modelOverride;
+    } else {
+      const modelFilePath = path.join(groupDir, '.model');
+      if (fs.existsSync(modelFilePath)) {
+        const perGroupModel = fs.readFileSync(modelFilePath, 'utf-8').trim();
+        if (perGroupModel) {
+          input.secrets.CLAUDE_MODEL = perGroupModel;
+        }
+      }
+    }
+
     input.routingConfig = readRoutingConfig(input.groupFolder);
+
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs
@@ -309,6 +343,7 @@ export async function runContainerAgent(
     let parseBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
+    let firstResponseTime: number | null = null;
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
@@ -331,6 +366,30 @@ export async function runContainerAgent(
       // Stream-parse for output markers
       if (onOutput) {
         parseBuffer += chunk;
+
+        // Parse STREAM_TEXT markers (real-time text deltas for draft display)
+        if (onStreamDelta) {
+          let stIdx: number;
+          while ((stIdx = parseBuffer.indexOf(STREAM_TEXT_MARKER)) !== -1) {
+            const stEnd = parseBuffer.indexOf(STREAM_TEXT_END_MARKER, stIdx);
+            if (stEnd === -1) break;
+
+            const streamText = parseBuffer
+              .slice(stIdx + STREAM_TEXT_MARKER.length, stEnd)
+              .trim();
+            parseBuffer = parseBuffer.slice(stEnd + STREAM_TEXT_END_MARKER.length);
+
+            if (streamText) {
+              try {
+                onStreamDelta(streamText);
+              } catch {
+                // Best-effort — don't break the main flow
+              }
+            }
+          }
+        }
+
+        // Parse OUTPUT markers (complete results)
         let startIdx: number;
         while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
           const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
@@ -345,6 +404,9 @@ export async function runContainerAgent(
             const parsed: ContainerOutput = JSON.parse(jsonStr);
             if (parsed.newSessionId) {
               newSessionId = parsed.newSessionId;
+            }
+            if (firstResponseTime === null && parsed.result) {
+              firstResponseTime = Date.now() - startTime;
             }
             hadStreamingOutput = true;
             // Activity detected — reset the hard timeout
@@ -436,6 +498,7 @@ export async function runContainerAgent(
             'Container timed out after output (idle cleanup)',
           );
           outputChain.then(() => {
+            logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: duration, status: 'success', exit_code: code, error: null, first_response_ms: firstResponseTime });
             resolve({
               status: 'success',
               result: null,
@@ -450,6 +513,7 @@ export async function runContainerAgent(
           'Container timed out with no output',
         );
 
+        logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: duration, status: 'timeout', exit_code: code, error: `Timed out after ${configTimeout}ms`, first_response_ms: firstResponseTime });
         resolve({
           status: 'error',
           result: null,
@@ -528,6 +592,7 @@ export async function runContainerAgent(
           'Container exited with error',
         );
 
+        logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: duration, status: 'error', exit_code: code, error: stderr.slice(-200), first_response_ms: firstResponseTime });
         resolve({
           status: 'error',
           result: null,
@@ -543,6 +608,7 @@ export async function runContainerAgent(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
           );
+          logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: duration, status: 'success', exit_code: code, error: null, first_response_ms: firstResponseTime });
           resolve({
             status: 'success',
             result: null,
@@ -581,6 +647,7 @@ export async function runContainerAgent(
           'Container completed',
         );
 
+        logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: duration, status: output.status === 'success' ? 'success' : 'error', exit_code: code, error: output.error || null, first_response_ms: firstResponseTime });
         resolve(output);
       } catch (err) {
         logger.error(
@@ -593,6 +660,7 @@ export async function runContainerAgent(
           'Failed to parse container output',
         );
 
+        logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: duration, status: 'error', exit_code: code, error: err instanceof Error ? err.message : String(err), first_response_ms: firstResponseTime });
         resolve({
           status: 'error',
           result: null,
@@ -604,6 +672,7 @@ export async function runContainerAgent(
     container.on('error', (err) => {
       clearTimeout(timeout);
       logger.error({ group: group.name, containerName, error: err }, 'Container spawn error');
+      logContainerRun({ group_folder: input.groupFolder, run_type: 'message', started_at: new Date(startTime).toISOString(), duration_ms: Date.now() - startTime, status: 'error', exit_code: null, error: err.message, first_response_ms: null });
       resolve({
         status: 'error',
         result: null,

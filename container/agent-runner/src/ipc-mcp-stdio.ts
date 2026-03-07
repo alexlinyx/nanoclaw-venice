@@ -41,7 +41,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
@@ -64,7 +64,7 @@ server.tool(
 
 server.tool(
   'schedule_task',
-  `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
+  `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 
 CONTEXT MODE - Choose based on task type:
 \u2022 "group": Task runs in the group's conversation context, with access to chat history. Use for tasks that need context about ongoing discussions, user preferences, or recent interactions.
@@ -130,8 +130,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // Non-main groups can only schedule for themselves
     const targetJid = isMain && args.target_group_jid ? args.target_group_jid : chatJid;
 
+    const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
     const data = {
       type: 'schedule_task',
+      taskId,
       prompt: args.prompt,
       schedule_type: args.schedule_type,
       schedule_value: args.schedule_value,
@@ -141,10 +144,59 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       timestamp: new Date().toISOString(),
     };
 
-    const filename = writeIpcFile(TASKS_DIR, data);
+    writeIpcFile(TASKS_DIR, data);
 
     return {
-      content: [{ type: 'text' as const, text: `Task scheduled (${filename}): ${args.schedule_type} - ${args.schedule_value}` }],
+      content: [{ type: 'text' as const, text: `Task ${taskId} scheduled: ${args.schedule_type} - ${args.schedule_value}` }],
+    };
+  },
+);
+
+server.tool(
+  'update_task',
+  'Update an existing scheduled task. Only provided fields are changed; omitted fields stay the same.',
+  {
+    task_id: z.string().describe('The task ID to update'),
+    prompt: z.string().optional().describe('New prompt for the task'),
+    schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type'),
+    schedule_value: z.string().optional().describe('New schedule value (see schedule_task for format)'),
+  },
+  async (args) => {
+    if (args.schedule_type === 'cron' && args.schedule_value) {
+      try {
+        CronExpressionParser.parse(args.schedule_value);
+      } catch {
+        return {
+          content: [{ type: 'text' as const, text: `Invalid cron: "${args.schedule_value}".` }],
+          isError: true,
+        };
+      }
+    }
+    if (args.schedule_type === 'interval' && args.schedule_value) {
+      const ms = parseInt(args.schedule_value, 10);
+      if (isNaN(ms) || ms <= 0) {
+        return {
+          content: [{ type: 'text' as const, text: `Invalid interval: "${args.schedule_value}".` }],
+          isError: true,
+        };
+      }
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'update_task',
+      taskId: args.task_id,
+      groupFolder,
+      isMain: isMain ? '1' : '0',
+      timestamp: new Date().toISOString(),
+    };
+    if (args.prompt !== undefined) data.prompt = args.prompt;
+    if (args.schedule_type !== undefined) data.schedule_type = args.schedule_type;
+    if (args.schedule_value !== undefined) data.schedule_value = args.schedule_value;
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Task ${args.task_id} update requested.` }],
     };
   },
 );
@@ -276,6 +328,73 @@ Use available_groups.json to find the JID for a group. The folder name should be
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+server.tool(
+  'send_progress',
+  'Send a progress update to the current group chat. Use for status updates while a longer task is running.',
+  {
+    text: z.string().describe('The progress update text'),
+  },
+  async (args) => {
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'message',
+      chatJid,
+      text: args.text,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+    return { content: [{ type: 'text' as const, text: 'Progress update sent.' }] };
+  },
+);
+
+server.tool(
+  'delegate_task',
+  `Delegate a task to an independent subagent that runs in its own container.
+The subagent starts immediately in the background — this tool returns right away so you stay available for conversation.
+
+USE THIS INSTEAD OF the Task tool when you want to run something in the background without blocking your responses.
+
+The subagent has the same tools you do (Bash, web search, file access, etc.) and will send progress updates and results back to the chat via send_message.
+
+CONTEXT MODE:
+• "group": Subagent runs with the group's conversation history. Use when the task needs context about what was discussed.
+• "isolated": Subagent runs with no conversation history. Use for self-contained tasks. Include all context in the prompt.
+
+PROMPT GUIDELINES:
+• Be specific about what the subagent should do and what output to produce
+• Tell it to use send_progress for milestone updates
+• Tell it to use send_message to deliver the final result`,
+  {
+    prompt: z.string().describe('Detailed instructions for the subagent. Include all context it needs.'),
+    task_name: z.string().describe('Short label for the task (e.g., "Research competitor pricing"). Used in progress messages.'),
+    context_mode: z.enum(['group', 'isolated']).default('group').describe('group=runs with chat history, isolated=fresh session'),
+    model: z.string().optional().describe('Model override (e.g., "claude-opus-4-6" for complex tasks). Defaults to the group model.'),
+    target_group_jid: z.string().optional().describe('(Main group only) JID of the group to run the task in. Defaults to the current group.'),
+  },
+  async (args) => {
+    const targetJid = isMain && args.target_group_jid ? args.target_group_jid : chatJid;
+
+    const data = {
+      type: 'delegate_task',
+      prompt: args.prompt,
+      context_mode: args.context_mode || 'group',
+      model: args.model || null,
+      taskName: args.task_name,
+      targetJid,
+      createdBy: groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Task "${args.task_name}" delegated. The subagent will start immediately in an independent container. You'll see progress updates in the chat. Continue responding normally.`,
+      }],
     };
   },
 );

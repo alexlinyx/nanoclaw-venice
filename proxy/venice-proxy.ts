@@ -87,9 +87,14 @@ interface AnthropicTool {
   input_schema: Record<string, unknown>;
 }
 
+type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
+
 interface OpenAIMessage {
   role: string;
-  content?: string | null;
+  content?: string | OpenAIContentPart[] | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -111,6 +116,7 @@ function translateMessages(anthropicMessages: AnthropicMessage[]): OpenAIMessage
       } else if (Array.isArray(msg.content)) {
         const toolResults = msg.content.filter((b) => b.type === 'tool_result');
         const textBlocks = msg.content.filter((b) => b.type === 'text');
+        const imageBlocks = msg.content.filter((b) => b.type === 'image');
 
         for (const tr of toolResults) {
           let content = '';
@@ -129,14 +135,34 @@ function translateMessages(anthropicMessages: AnthropicMessage[]): OpenAIMessage
           });
         }
 
-        if (textBlocks.length > 0) {
+        // If there are image blocks, build multimodal content parts
+        if (imageBlocks.length > 0) {
+          const parts: OpenAIContentPart[] = [];
+          for (const b of textBlocks) {
+            if (b.text) parts.push({ type: 'text', text: b.text });
+          }
+          for (const b of imageBlocks) {
+            const src = b.source as { type?: string; media_type?: string; data?: string } | undefined;
+            if (src?.type === 'base64' && src.data) {
+              const mediaType = src.media_type || 'image/jpeg';
+              parts.push({
+                type: 'image_url',
+                image_url: { url: `data:${mediaType};base64,${src.data}` },
+              });
+            }
+          }
+          if (parts.length > 0) {
+            openaiMessages.push({ role: 'user', content: parts });
+          }
+        } else if (textBlocks.length > 0) {
           const text = textBlocks.map((b) => b.text || '').join('\n');
           if (text) {
             openaiMessages.push({ role: 'user', content: text });
           }
         }
 
-        if (toolResults.length === 0 && textBlocks.length === 0) {
+        // If no text blocks, no image blocks, and no tool results, concatenate all content
+        if (toolResults.length === 0 && textBlocks.length === 0 && imageBlocks.length === 0) {
           const text = msg.content.map((b) => b.text || JSON.stringify(b)).join('\n');
           openaiMessages.push({ role: 'user', content: text });
         }

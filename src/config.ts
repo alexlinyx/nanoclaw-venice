@@ -19,6 +19,7 @@ export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
+export const MAX_MESSAGE_AGE = 30 * 60 * 1000; // 30 minutes — drop messages older than this
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
@@ -30,6 +31,12 @@ export const MOUNT_ALLOWLIST_PATH = path.join(
   '.config',
   'nanoclaw',
   'mount-allowlist.json',
+);
+export const SENDER_ALLOWLIST_PATH = path.join(
+  HOME_DIR,
+  '.config',
+  'nanoclaw',
+  'sender-allowlist.json',
 );
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
@@ -48,9 +55,21 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
 ); // 10MB default
 export const IPC_POLL_INTERVAL = 1000;
 export const IDLE_TIMEOUT = parseInt(
-  process.env.IDLE_TIMEOUT || '300000',
+  process.env.IDLE_TIMEOUT || '900000',
   10,
-); // 5min default — how long to keep container alive after last result
+); // 15min default — how long to keep container alive after last result
+export const SESSION_IDLE_TTL_MS = parseInt(
+  process.env.SESSION_IDLE_TTL_MS || '1800000',
+  10,
+); // 30min default — sessions idle longer than this are cleared
+export const MAX_IPC_MESSAGES_PER_CONTAINER = parseInt(
+  process.env.MAX_IPC_MESSAGES || '30',
+  10,
+);
+export const CIRCUIT_BREAKER_THRESHOLD = parseInt(
+  process.env.CIRCUIT_BREAKER_THRESHOLD || '3',
+  10,
+);
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
