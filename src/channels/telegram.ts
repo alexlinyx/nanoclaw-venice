@@ -104,6 +104,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private botInfo: { username: string; id: number } | null = null;
   // Active streaming drafts: jid → { messageId, lastEditTime }
   private drafts = new Map<string, { messageId: number; lastEditTime: number }>();
 
@@ -322,6 +323,7 @@ export class TelegramChannel implements Channel {
     return new Promise<void>((resolve) => {
       this.bot!.start({
         onStart: (botInfo) => {
+          this.botInfo = { username: botInfo.username, id: botInfo.id };
           logger.info(
             { username: botInfo.username, id: botInfo.id },
             'Telegram bot connected',
@@ -435,8 +437,13 @@ export class TelegramChannel implements Channel {
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
+      this.botInfo = null;
       logger.info('Telegram bot stopped');
     }
+  }
+
+  getBotInfo(): { username: string; id: number } | null {
+    return this.botInfo;
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {

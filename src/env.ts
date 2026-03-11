@@ -40,3 +40,43 @@ export function readEnvFile(keys: string[]): Record<string, string> {
 
   return result;
 }
+
+export function updateEnvFile(patch: Record<string, string | null | undefined>): void {
+  const envFile = path.join(process.cwd(), '.env');
+  let lines: string[] = [];
+
+  try {
+    lines = fs.readFileSync(envFile, 'utf-8').split('\n');
+  } catch {
+    lines = [];
+  }
+
+  const remaining = new Map(
+    Object.entries(patch).filter(([, value]) => value !== undefined),
+  );
+
+  const nextLines = lines
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return line;
+
+      const eqIdx = line.indexOf('=');
+      if (eqIdx === -1) return line;
+
+      const key = line.slice(0, eqIdx).trim();
+      if (!remaining.has(key)) return line;
+
+      const value = remaining.get(key);
+      remaining.delete(key);
+      if (value === null) return null;
+      return `${key}=${value}`;
+    })
+    .filter((line): line is string => line !== null);
+
+  for (const [key, value] of remaining.entries()) {
+    if (value === null) continue;
+    nextLines.push(`${key}=${value}`);
+  }
+
+  fs.writeFileSync(envFile, `${nextLines.join('\n').replace(/\n+$/g, '')}\n`);
+}

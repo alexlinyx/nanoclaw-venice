@@ -9,14 +9,26 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'CONTROL_API_PORT',
+  'CONTROL_API_TOKEN',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_ONLY',
+  'TRIGGER_WORD',
+  'VENICE_MODEL_DEFAULT',
 ]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+export const TRIGGER_WORD =
+  process.env.TRIGGER_WORD || envConfig.TRIGGER_WORD || `@${ASSISTANT_NAME}`;
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+export const CONTROL_API_PORT = parseInt(
+  process.env.CONTROL_API_PORT || envConfig.CONTROL_API_PORT || '0',
+  10,
+);
+export const CONTROL_API_TOKEN =
+  process.env.CONTROL_API_TOKEN || envConfig.CONTROL_API_TOKEN || '';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 export const MAX_MESSAGE_AGE = 30 * 60 * 1000; // 30 minutes — drop messages older than this
@@ -94,3 +106,5 @@ export const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
 export const TELEGRAM_ONLY =
   (process.env.TELEGRAM_ONLY || envConfig.TELEGRAM_ONLY) === 'true';
+export const VENICE_MODEL_DEFAULT =
+  process.env.VENICE_MODEL_DEFAULT || envConfig.VENICE_MODEL_DEFAULT || 'claude-sonnet-4-6';

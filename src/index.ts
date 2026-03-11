@@ -12,6 +12,7 @@ import {
   TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
+import { startControlServer } from './control-server.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import { TelegramChannel } from './channels/telegram.js';
 import {
@@ -57,6 +58,7 @@ let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
 let whatsapp: WhatsAppChannel | undefined;
+let telegram: TelegramChannel | undefined;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
@@ -678,10 +680,12 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  let controlServer: import('node:http').Server | null = null;
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    await new Promise<void>((resolve) => controlServer?.close(() => resolve()) ?? resolve());
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -705,10 +709,27 @@ async function main(): Promise<void> {
   }
 
   if (TELEGRAM_BOT_TOKEN) {
-    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
     channels.push(telegram);
     await telegram.connect();
   }
+
+  controlServer = await startControlServer({
+    getRegisteredGroups: () => registeredGroups,
+    registerGroup,
+    getTelegramConnectionInfo: () => {
+      const info = telegram?.getBotInfo();
+      return {
+        connected: telegram?.isConnected() ?? false,
+        username: info?.username ?? null,
+        id: info?.id ?? null,
+      };
+    },
+    requestRestart: () => {
+      logger.info('Control API requested runtime restart');
+      process.kill(process.pid, 'SIGTERM');
+    },
+  });
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
